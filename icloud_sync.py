@@ -31,36 +31,48 @@ CALDAV_URL = "https://caldav.icloud.com/"
 # Нижний Новгород = UTC+3 круглый год (без перевода часов)
 LOCAL_UTC_OFFSET = datetime.timedelta(hours=3)
 
+# API передаёт фамилию с инициалами. Здесь можно указать проверенные полные ФИО.
+# Формат: "Иванов И. И.": "Иванов Иван Иванович".
+INSTRUCTOR_FULL_NAMES: dict[str, str] = {}
+
 
 def to_utc(local_dt: datetime.datetime) -> datetime.datetime:
     return (local_dt - LOCAL_UTC_OFFSET).replace(tzinfo=datetime.timezone.utc)
 
 
-def build_ics(uid: str, ev: dict) -> str:
-    summary = ev["subject"]
+def desired_event_fields(ev: dict) -> dict:
+    time_range = f"{ev['start']:%H:%M}–{ev['end']:%H:%M}"
+    subject = ev["subject"]
     if ev["is_change"]:
-        summary = f"[ИЗМЕНЕНО] {summary}"
+        subject = f"[ИЗМЕНЕНО] {subject}"
+    summary = f"{time_range} · {subject}"
 
     description_lines = []
     if ev["instructors"]:
-        description_lines.append("Преподаватель: " + ", ".join(ev["instructors"]))
+        instructors = ", ".join(INSTRUCTOR_FULL_NAMES.get(name, name) for name in ev["instructors"])
+        summary += f" — {instructors}"
+        description_lines.append(f"Преподаватель: {instructors}")
     if ev["note"]:
         description_lines.append(ev["note"])
 
-    start_utc = to_utc(datetime.datetime.combine(ev["date"], ev["start"]))
-    end_utc = to_utc(datetime.datetime.combine(ev["date"], ev["end"]))
+    return {
+        "summary": summary,
+        "location": ev["office"],
+        "description": "\n".join(description_lines),
+        "dtstart": to_utc(datetime.datetime.combine(ev["date"], ev["start"])),
+        "dtend": to_utc(datetime.datetime.combine(ev["date"], ev["end"])),
+    }
 
+
+def build_ics(uid: str, fields: dict) -> str:
     cal = ICalendar()
     cal.add("prodid", "-//schedule-sync//ru//")
     cal.add("version", "2.0")
 
     vevent = ICalEvent()
     vevent.add("uid", f"{uid}@schedule-sync")
-    vevent.add("summary", summary)
-    vevent.add("dtstart", start_utc)
-    vevent.add("dtend", end_utc)
-    vevent.add("location", ev["office"])
-    vevent.add("description", "\n".join(description_lines))
+    for name, value in fields.items():
+        vevent.add(name, value)
     cal.add_component(vevent)
 
     return cal.to_ical().decode("utf-8")
@@ -78,23 +90,6 @@ def extract_fields(ical_text: str) -> dict:
             "dtend": component.get("dtend").dt,
         }
     return {}
-
-
-def event_needs_update(existing_fields: dict, uid: str, ev: dict) -> bool:
-    desired_summary = ev["subject"]
-    if ev["is_change"]:
-        desired_summary = f"[ИЗМЕНЕНО] {desired_summary}"
-    if existing_fields.get("summary", "") != desired_summary:
-        return True
-    if existing_fields.get("location", "") != ev["office"]:
-        return True
-    desired_start = to_utc(datetime.datetime.combine(ev["date"], ev["start"]))
-    desired_end = to_utc(datetime.datetime.combine(ev["date"], ev["end"]))
-    if existing_fields.get("dtstart") != desired_start:
-        return True
-    if existing_fields.get("dtend") != desired_end:
-        return True
-    return False
 
 
 def get_target_calendar():
@@ -126,18 +121,16 @@ def sync_to_icloud(desired_events: dict):
     created = updated = deleted = unchanged = 0
 
     for uid, ev in desired_events.items():
-        ics_text = build_ics(uid, ev)
+        fields = desired_event_fields(ev)
         if uid not in existing:
-            calendar.save_event(ics_text)
+            calendar.save_event(build_ics(uid, fields))
             created += 1
+        elif extract_fields(existing[uid].data) != fields:
+            existing[uid].data = build_ics(uid, fields)
+            existing[uid].save()
+            updated += 1
         else:
-            existing_fields = extract_fields(existing[uid].data)
-            if event_needs_update(existing_fields, uid, ev):
-                existing[uid].data = ics_text
-                existing[uid].save()
-                updated += 1
-            else:
-                unchanged += 1
+            unchanged += 1
 
     stale_uids = set(existing.keys()) - set(desired_events.keys())
     for uid in stale_uids:
